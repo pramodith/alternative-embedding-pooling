@@ -43,10 +43,7 @@ class CustomPooler:
         Returns:
             torch.Tensor of embeddings for all documents
         """
-        docs = [""] * len(self.corpus)
-        for key, val in self.corpus.items():
-            docs[int(key)] = val
-        self.embedding_store = self.embedding_model.encode(docs, batch_size=batch_size)
+        self.embedding_store = self.embedding_model.encode(self.corpus.values, batch_size=batch_size)
     
     
     def retrieve_top_k_docs(self, query:str, top_k: int = 10) -> tuple:
@@ -59,10 +56,13 @@ class CustomPooler:
         Returns:
             List[Tuple[str, str, float]]: A list of tuples where each tuple contains the document_id,
                 retrieved documents text and retrieval score.
+
         """
         query_emb =  self.embedding_model.encode([query], prompt_name="query")
         similarity_scores = self.embedding_model.similarity(query_emb, self.embedding_store)
-        top_k_scores, top_k_docs = torch.topk(similarity_scores, top_k, dim=1)        
+        top_k_scores, top_k_docs = torch.topk(similarity_scores, top_k, dim=1)
+        corpus_doc_ids = list(self.corpus.keys())
+        top_k_docs = [corpus_doc_ids[i] for i in top_k_docs]
         retrieved_docs  = [
             (doc_id, self.relevant_docs[doc_id], score.item()) for doc_id, score in (top_k_docs, top_k_scores)
         ]
@@ -90,7 +90,7 @@ class CustomPooler:
         
 
 if __name__ == "__main__":
-    custom_pooler = CustomPooler("Qwen/Qwen3-Embedding-0.6B")
+    custom_pooler = CustomPooler("Qwen/Qwen3-Embedding-0.6B", "NFCorpus")
     custom_pooler.embed_documents()
     num_queries = 1
     for query_id, query in custom_pooler.queries.items():
