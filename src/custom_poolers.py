@@ -280,7 +280,7 @@ class CustomQwenEmbeddingModel:
 
 
 @click.command()
-@click.option("--model-name", default="Qwen/Qwen3-Embedding-0.6B", help="The name of the embedding model.")
+@click.option("--model-name", default="sentence-transformers/all-MiniLM-L12-v2", help="The name of the embedding model.")
 @click.option("--dataset-name", default="ArguAna", help="The name of the dataset to use.")
 @click.option("--batch-size", default=16, show_default=True, help="Batch size for embedding.")
 @click.option("--num-queries", default=1, show_default=True, help="Number of queries to process.")
@@ -305,6 +305,7 @@ def main(model_name, dataset_name, batch_size, num_queries, do_benchmark):
             if ind + 1 == num_queries:
                 break
     else:
+        print(f"Benchmarking to start.")
         custom_pooler.benchmark_model()
 
 
