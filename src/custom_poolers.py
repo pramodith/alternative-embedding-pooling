@@ -296,16 +296,17 @@ class CustomQwenEmbeddingModel:
 @click.option(
     "--do-benchmark", 
     is_flag=True, 
-    default=True, 
+    default=False, 
     help="Whether to benchmark the model on the dataset"
 )
 @click.option(
     "--is-baseline", 
     is_flag=True, 
-    default=True, 
+    default=False, 
     help="Whether to use the default pooler or not."
 )
 def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_baseline):
+    print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}")
     custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name, is_baseline)
     save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
     if not do_benchmark:
