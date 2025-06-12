@@ -287,7 +287,7 @@ class CustomQwenEmbeddingModel:
 @click.option(
     "--do-benchmark", 
     is_flag=True, 
-    default=False, 
+    default=True, 
     show_default=True, 
     help="Whether to benchmark the model on the dataset"
 )
