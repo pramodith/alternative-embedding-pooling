@@ -14,6 +14,7 @@ class SinkTokenPooling(models.Pooling):
     def __init__(
         self,
         n_sink_tokens: int,
+        word_embedding_dimension: int,
         pooling_mode: str | None = None,
         pooling_mode_cls_token: bool = False,
         pooling_mode_max_tokens: bool = False,
@@ -53,14 +54,15 @@ class SinkTokenPooling(models.Pooling):
 
         """
         super().__init__(
-            pooling_mode,
-            pooling_mode_cls_token,
-            pooling_mode_max_tokens,
-            pooling_mode_mean_tokens,
-            pooling_mode_mean_sqrt_len_tokens,
-            pooling_mode_weightedmean_tokens,
-            pooling_mode_lasttoken,
-            include_prompt,
+            word_embedding_dimension=word_embedding_dimension,  # Replace `None` with the actual dimension if known
+            pooling_mode=pooling_mode,
+            pooling_mode_cls_token=pooling_mode_cls_token,
+            pooling_mode_max_tokens=pooling_mode_max_tokens,
+            pooling_mode_mean_tokens=pooling_mode_mean_tokens,
+            pooling_mode_mean_sqrt_len_tokens=pooling_mode_mean_sqrt_len_tokens,
+            pooling_mode_weightedmean_tokens=pooling_mode_weightedmean_tokens,
+            pooling_mode_lasttoken=pooling_mode_lasttoken,
+            include_prompt=include_prompt,
         )
 
         self.n_sink_tokens = n_sink_tokens
@@ -189,7 +191,7 @@ class CustomQwenEmbeddingModel:
 
         """
         self.transformer = models.Transformer(model_name)
-        self.sink_token_pooler = SinkTokenPooling(16, pooling_mode_lasttoken=True)
+        self.sink_token_pooler = SinkTokenPooling(16, 1024, pooling_mode=None, pooling_mode_lasttoken=True)
         self.normalize = models.Normalize()
         self.embedding_model: SentenceTransformer = SentenceTransformer(
             modules=[self.transformer, self.sink_token_pooler, self.normalize]
@@ -278,11 +280,17 @@ class CustomQwenEmbeddingModel:
 
 
 @click.command()
-@click.option("--model-name", required=True, help="The name of the embedding model.")
-@click.option("--dataset-name", required=True, help="The name of the dataset to use.")
+@click.option("--model-name", default="Qwen/Qwen3-Embedding-0.6B", help="The name of the embedding model.")
+@click.option("--dataset-name", default="ArguAna", help="The name of the dataset to use.")
 @click.option("--batch-size", default=16, show_default=True, help="Batch size for embedding.")
 @click.option("--num-queries", default=1, show_default=True, help="Number of queries to process.")
-@click.option("--do-benchmark", default=False, show_default=True, help="Whether to benchmark the model on the dataset")
+@click.option(
+    "--do-benchmark", 
+    is_flag=True, 
+    default=False, 
+    show_default=True, 
+    help="Whether to benchmark the model on the dataset"
+)
 def main(model_name, dataset_name, batch_size, num_queries, do_benchmark):
     custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name)
     save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
@@ -301,4 +309,4 @@ def main(model_name, dataset_name, batch_size, num_queries, do_benchmark):
 
 
 if __name__ == "__main__":
-    main()
+    main("")
