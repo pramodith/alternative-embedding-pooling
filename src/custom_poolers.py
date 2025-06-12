@@ -199,6 +199,7 @@ class CustomQwenEmbeddingModel:
             self.embedding_model: SentenceTransformer = SentenceTransformer(
                 modules=[self.transformer, self.sink_token_pooler, self.normalize]
             )
+            self.embedding_model.model_card_data.model_name = f"{model_name}-sink-pooler"
         else:
             self.embedding_model: SentenceTransformer = SentenceTransformer(model_name)
         self.dataset_name = dataset_name
@@ -283,7 +284,7 @@ class CustomQwenEmbeddingModel:
         # Here, self.embedding_model is already a SentenceTransformer instance
         results = MTEB(tasks=[self.dataset_name]).run(self.embedding_model, verbosity=2)
         for result in results:
-            print(result.model_dump(), indent=2)
+            print(result.model_dump())
         return results
 
 
