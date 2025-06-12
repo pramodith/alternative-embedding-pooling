@@ -196,6 +196,7 @@ class CustomQwenEmbeddingModel:
         self.embedding_model: SentenceTransformer = SentenceTransformer(
             modules=[self.transformer, self.sink_token_pooler, self.normalize]
         )
+        self.dataset_name = dataset_name
         self.queries, self.corpus, self.relevant_docs = get_mteb_retrieval_dataset(dataset_name)
 
     def load_embedded_documents(self, load_path: str):
