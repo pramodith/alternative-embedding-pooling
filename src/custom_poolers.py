@@ -3,6 +3,7 @@ from sentence_transformers import SentenceTransformer
 
 from mteb_utils import get_mteb_retrieval_dataset
 import numpy as np
+import click
 
 
 class CustomPooler: 
@@ -113,18 +114,23 @@ class CustomPooler:
         return false_positives
         
 
-if __name__ == "__main__":
-    model_name = "Qwen/Qwen3-Embedding-0.6B"
-    dataset_name = "NFCorpus"
+@click.command()
+@click.option('--model-name', required=True, help='The name of the embedding model.')
+@click.option('--dataset-name', required=True, help='The name of the dataset to use.')
+@click.option('--batch-size', default=16, show_default=True, help='Batch size for embedding.')
+@click.option('--num-queries', default=1, show_default=True, help='Number of queries to process.')
+def main(model_name, dataset_name, batch_size, num_queries):
     custom_pooler = CustomPooler(model_name, dataset_name)
-    custom_pooler.embed_documents(f"./data/{model_name.split("/")[1]}_{dataset_name}.npy", batch_size=16)
-    num_queries = 1
+    save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
+    custom_pooler.embed_documents(save_path, batch_size=batch_size)
     for ind, (query_id, query) in enumerate(custom_pooler.queries.items()):
         print(f"Query document is:\n {query}")
         retrieved_docs = custom_pooler.retrieve_top_k_docs(query)
         false_positives = custom_pooler.get_false_positives(query_id, retrieved_docs)
         for fp in false_positives:
-            print(f"False Positive Document:\n {fp}")
-            print()
-        if ind == num_queries:
+            print(f"False Positive Document:\n {fp}\n")
+        if ind + 1 == num_queries:
             break
+
+if __name__ == "__main__":
+    main()
