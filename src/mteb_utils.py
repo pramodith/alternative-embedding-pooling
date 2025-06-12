@@ -1,13 +1,9 @@
-from typing import Any
 
 import mteb
 
 
 def get_mteb_retrieval_dataset(
-    dataset_name: str = "NFCorpus", 
-    split: str = "test", 
-    n_samples: int = 1, 
-    verbose: bool = False
+    dataset_name: str = "NFCorpus", split: str = "test", n_samples: int = 1, verbose: bool = False
 ) -> tuple:
     """Load and inspect an MTEB retrieval dataset.
 
@@ -23,7 +19,7 @@ def get_mteb_retrieval_dataset(
 
     Returns:
         Tuple[List[str], List[str], List[str]] A tuple of the queries, corpus and relevant docs.
-        
+
     """
     # Load the dataset
     task = mteb.get_task(dataset_name, eval_splits=[split])
@@ -45,6 +41,7 @@ def get_mteb_retrieval_dataset(
                     print()
 
     return queries, corpus, relevant_docs
+
 
 if __name__ == "__main__":
     result = inspect_mteb_retrieval_dataset()  # Uses defaults
