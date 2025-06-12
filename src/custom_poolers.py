@@ -7,7 +7,6 @@ from sentence_transformers import SentenceTransformer, models
 from mteb_utils import get_mteb_retrieval_dataset
 from mteb import MTEB
 
-
 class SinkTokenPooling(models.Pooling):
     """Pool the sink tokens."""
 
@@ -86,7 +85,6 @@ class SinkTokenPooling(models.Pooling):
 
             attention_mask[:, :prompt_length] = 0
 
-        attention_mask[:, self.n_sink_tokens :] = 0
 
         ## Pooling strategy
         output_vectors = []
@@ -101,6 +99,10 @@ class SinkTokenPooling(models.Pooling):
             max_over_time = torch.max(token_embeddings, 1)[0]
             output_vectors.append(max_over_time)
         if self.pooling_mode_mean_tokens or self.pooling_mode_mean_sqrt_len_tokens:
+            # find the last index where the attention mask is 1
+            last_token_index = torch.argmax(torch.cumsum(attention_mask, dim=1), dim=1)
+            attention_mask[:, self.n_sink_tokens:] = 0
+            attention_mask = attention_mask.scatter(1, last_token_index.unsqueeze(1), 1)
             input_mask_expanded = (
                 attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
             )
@@ -146,7 +148,6 @@ class SinkTokenPooling(models.Pooling):
             output_vectors.append(sum_embeddings / sum_mask)
         if self.pooling_mode_lasttoken:
             bs, seq_len, hidden_dim = token_embeddings.shape
-            attention_mask[:, -1] = 1
             # attention_mask shape: (bs, seq_len)
             # Get shape [bs] indices of the last token (i.e. the last token for each batch item)
             # Use flip and max() to get the last index of 1 in the attention mask
@@ -182,19 +183,26 @@ class SinkTokenPooling(models.Pooling):
 class CustomQwenEmbeddingModel:
     """A class that implements a custom pooler for embedding models."""
 
-    def __init__(self, model_name: str, dataset_name: str, is_baseline: bool = False):
+    def __init__(
+        self, 
+        model_name: str, 
+        dataset_name: str, 
+        is_baseline: bool = False, 
+        n_sink_tokens: int = 16
+    ):
         """Initialize the class.
 
         Args:
             model_name (str): The name of the embedding model.
             dataset_name (str): The name of the dataset to download
             is_baseline (bool): Whether the default pooling mechanism should be used or not
+            n_sink_tokens (int): Number of sink tokens to use
 
         """
         
         if not is_baseline:
             self.transformer = models.Transformer(model_name)
-            self.sink_token_pooler = SinkTokenPooling(16, 1024, pooling_mode=None, pooling_mode_lasttoken=True)
+            self.sink_token_pooler = SinkTokenPooling(n_sink_tokens, 1024, pooling_mode=None, pooling_mode_lasttoken=True)
             self.normalize = models.Normalize()
             self.embedding_model: SentenceTransformer = SentenceTransformer(
                 modules=[self.transformer, self.sink_token_pooler, self.normalize]
@@ -278,25 +286,34 @@ class CustomQwenEmbeddingModel:
 
         return false_positives
     
-    def benchmark_model(self):
-        """Benchmarks the custom model on the dataset using MTEB."""
+    def benchmark_model(self, batch_size: int = 16):
+        """Benchmarks the custom model on the dataset using MTEB.
+        
+        Args:
+            batch_size (int): The batch size to use.
+        
+        Returns:
+            List[Dict]: The results of the benchmark.
+        """
         # Create a SentenceTransformer-like wrapper for the custom model if needed
         # Here, self.embedding_model is already a SentenceTransformer instance
-        results = MTEB(tasks=[self.dataset_name]).run(self.embedding_model, verbosity=2)
+        results = MTEB(tasks=[self.dataset_name]).run(
+            self.embedding_model, verbosity=2, batch_size=batch_size, prompt_name="query"
+        )
         for result in results:
             print(result.model_dump())
         return results
 
 
 @click.command()
-@click.option("--model-name", default="sentence-transformers/all-MiniLM-L12-v2", help="The name of the embedding model.")
+@click.option("--model-name", default="Qwen/Qwen3-Embedding-0.6B", help="The name of the embedding model.")
 @click.option("--dataset-name", default="ArguAna", help="The name of the dataset to use.")
 @click.option("--batch-size", default=16, show_default=True, help="Batch size for embedding.")
 @click.option("--num-queries", default=1, show_default=True, help="Number of queries to process.")
 @click.option(
     "--do-benchmark", 
     is_flag=True, 
-    default=False, 
+    default=True, 
     help="Whether to benchmark the model on the dataset"
 )
 @click.option(
@@ -305,9 +322,10 @@ class CustomQwenEmbeddingModel:
     default=False, 
     help="Whether to use the default pooler or not."
 )
-def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_baseline):
+@click.option("--n-sink-tokens", default=16, show_default=True, help="Number of sink tokens to use.")
+def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_baseline, n_sink_tokens):
     print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}")
-    custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name, is_baseline)
+    custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name, is_baseline, n_sink_tokens)
     save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
     if not do_benchmark:
         custom_pooler.embed_documents(save_path, batch_size=batch_size)
@@ -321,7 +339,7 @@ def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_bas
                 break
     else:
         print(f"Benchmarking to start.")
-        custom_pooler.benchmark_model()
+        custom_pooler.benchmark_model(batch_size=batch_size)
 
 
 if __name__ == "__main__":
