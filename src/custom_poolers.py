@@ -324,4 +324,4 @@ def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_bas
 
 
 if __name__ == "__main__":
-    main("")
+    main()
