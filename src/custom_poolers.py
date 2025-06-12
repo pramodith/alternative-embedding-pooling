@@ -282,7 +282,8 @@ class CustomQwenEmbeddingModel:
         # Create a SentenceTransformer-like wrapper for the custom model if needed
         # Here, self.embedding_model is already a SentenceTransformer instance
         results = MTEB(tasks=[self.dataset_name]).run(self.embedding_model, verbosity=2)
-        print(results.dict(), indent=2)
+        for result in results:
+            print(result.dict(), indent=2)
         return results
 
 
