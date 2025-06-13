@@ -1,8 +1,11 @@
 
 import click
 import numpy as np
+import string
 import torch
 from sentence_transformers import SentenceTransformer, models
+from transformers import AutoTokenizer
+from typing import Optional
 
 from mteb_utils import get_mteb_retrieval_dataset
 from mteb import MTEB
@@ -13,6 +16,7 @@ class SinkTokenPooling(models.Pooling):
     def __init__(
         self,
         n_sink_tokens: int,
+        tokenizer: AutoTokenizer,
         word_embedding_dimension: int,
         pooling_mode: str | None = None,
         pooling_mode_cls_token: bool = False,
@@ -63,11 +67,28 @@ class SinkTokenPooling(models.Pooling):
             pooling_mode_lasttoken=pooling_mode_lasttoken,
             include_prompt=include_prompt,
         )
-
+        self.tokenizer = tokenizer
         self.n_sink_tokens = n_sink_tokens
 
     def forward(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         token_embeddings = features["token_embeddings"]
+        punct_mask = []
+        special_tokens = self.tokenizer.all_special_tokens
+        if self.tokenizer.pad_token:
+            special_tokens.remove(self.tokenizer.pad_token)
+        if self.tokenizer.mask_token:
+            special_tokens.remove(self.tokenizer.mask_token)
+        for input_seq in features["input_ids"]:
+            punct_mask.append([])
+            tokens = self.tokenizer.convert_ids_to_tokens(input_seq.tolist())
+            for token in tokens:
+                if token in string.punctuation or token in self.tokenizer.all_special_tokens:
+                    punct_mask[-1].append(1)
+                else:
+                    punct_mask[-1].append(0)
+        
+        punct_mask = torch.Tensor(punct_mask)
+                
         attention_mask = (
             features["attention_mask"]
             if "attention_mask" in features
@@ -85,19 +106,8 @@ class SinkTokenPooling(models.Pooling):
 
             attention_mask[:, :prompt_length] = 0
 
-
         ## Pooling strategy
         output_vectors = []
-        if self.pooling_mode_cls_token:
-            cls_token = features.get("cls_token_embeddings", token_embeddings[:, 0])  # Take first token by default
-            output_vectors.append(cls_token)
-        if self.pooling_mode_max_tokens:
-            input_mask_expanded = (
-                attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
-            )
-            token_embeddings[input_mask_expanded == 0] = -1e9  # Set padding tokens to large negative value
-            max_over_time = torch.max(token_embeddings, 1)[0]
-            output_vectors.append(max_over_time)
         if self.pooling_mode_mean_tokens or self.pooling_mode_mean_sqrt_len_tokens:
             # find the last index where the attention mask is 1
             last_token_index = torch.argmax(torch.cumsum(attention_mask, dim=1), dim=1)
@@ -120,61 +130,7 @@ class SinkTokenPooling(models.Pooling):
                 output_vectors.append(sum_embeddings / sum_mask)
             if self.pooling_mode_mean_sqrt_len_tokens:
                 output_vectors.append(sum_embeddings / torch.sqrt(sum_mask))
-        if self.pooling_mode_weightedmean_tokens:
-            input_mask_expanded = (
-                attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
-            )
-            # token_embeddings shape: bs, seq, hidden_dim
-            weights = (
-                torch.arange(start=1, end=token_embeddings.shape[1] + 1)
-                .unsqueeze(0)
-                .unsqueeze(-1)
-                .expand(token_embeddings.size())
-                .to(token_embeddings.dtype)
-                .to(token_embeddings.device)
-            )
-            assert weights.shape == token_embeddings.shape == input_mask_expanded.shape
-            input_mask_expanded = input_mask_expanded * weights
-
-            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-
-            # If tokens are weighted (by WordWeights layer), feature 'token_weights_sum' will be present
-            if "token_weights_sum" in features:
-                sum_mask = features["token_weights_sum"].unsqueeze(-1).expand(sum_embeddings.size())
-            else:
-                sum_mask = input_mask_expanded.sum(1)
-
-            sum_mask = torch.clamp(sum_mask, min=1e-9)
-            output_vectors.append(sum_embeddings / sum_mask)
-        if self.pooling_mode_lasttoken:
-            bs, seq_len, hidden_dim = token_embeddings.shape
-            # attention_mask shape: (bs, seq_len)
-            # Get shape [bs] indices of the last token (i.e. the last token for each batch item)
-            # Use flip and max() to get the last index of 1 in the attention mask
-
-            if torch.jit.is_tracing():
-                # Avoid tracing the argmax with int64 input that can not be handled by ONNX Runtime: https://github.com/microsoft/onnxruntime/issues/10068
-                attention_mask = attention_mask.to(torch.int32)
-
-            values, indices = attention_mask.flip(1).max(1)
-            indices = torch.where(values == 0, seq_len - 1, indices)
-            gather_indices = seq_len - indices - 1
-
-            # Turn indices from shape [bs] --> [bs, 1, hidden_dim]
-            gather_indices = gather_indices.unsqueeze(-1).repeat(1, hidden_dim)
-            gather_indices = gather_indices.unsqueeze(1)
-            assert gather_indices.shape == (bs, 1, hidden_dim)
-
-            # Gather along the 1st dim (seq_len) (bs, seq_len, hidden_dim -> bs, hidden_dim)
-            # Actually no need for the attention mask as we gather the last token where attn_mask = 1
-            # but as we set some indices (which shouldn't be attended to) to 0 with clamp, we
-            # use the attention mask to ignore them again
-            input_mask_expanded = (
-                attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
-            )
-            embedding = torch.gather(token_embeddings * input_mask_expanded, 1, gather_indices).squeeze(dim=1)
-            output_vectors.append(embedding)
-
+        
         output_vector = torch.cat(output_vectors, 1)
         features["sentence_embedding"] = output_vector
         return features
@@ -188,7 +144,8 @@ class CustomQwenEmbeddingModel:
         model_name: str, 
         dataset_name: str, 
         is_baseline: bool = False, 
-        n_sink_tokens: int = 16
+        n_sink_tokens: int = 16,
+        tokenizer: Optional[AutoTokenizer] = None
     ):
         """Initialize the class.
 
@@ -197,12 +154,19 @@ class CustomQwenEmbeddingModel:
             dataset_name (str): The name of the dataset to download
             is_baseline (bool): Whether the default pooling mechanism should be used or not
             n_sink_tokens (int): Number of sink tokens to use
+            tokenizer (AutoTokenizer): The tokenizer corresponding to the embedding model.
 
         """
         
         if not is_baseline:
             self.transformer = models.Transformer(model_name)
-            self.sink_token_pooler = SinkTokenPooling(n_sink_tokens, 1024, pooling_mode=None, pooling_mode_lasttoken=True)
+            self.sink_token_pooler = SinkTokenPooling(
+                n_sink_tokens, 
+                tokenizer,
+                1024, 
+                pooling_mode=None, 
+                pooling_mode_lasttoken=True
+            )
             self.normalize = models.Normalize()
             self.embedding_model: SentenceTransformer = SentenceTransformer(
                 modules=[self.transformer, self.sink_token_pooler, self.normalize]
@@ -243,6 +207,7 @@ class CustomQwenEmbeddingModel:
         np.save(save_path, self.embedding_store)
         return self.embedding_store
 
+
     def retrieve_top_k_docs(self, query: str, top_k: int = 10) -> tuple:
         """Retrieve top k documents from the corpus for a given query.
 
@@ -266,6 +231,7 @@ class CustomQwenEmbeddingModel:
             (doc_id, self.corpus[doc_id], score.item()) for doc_id, score in zip(top_k_docs, top_k_scores, strict=False)
         ]
         return retrieved_docs
+    
 
     def get_false_positives(self, query_id: str, retrieved_docs: list[tuple[str, float]]) -> list[str]:
         """Find the false positive docs.
@@ -306,7 +272,7 @@ class CustomQwenEmbeddingModel:
 
 
 @click.command()
-@click.option("--model-name", default="Qwen/Qwen3-Embedding-0.6B", help="The name of the embedding model.")
+@click.option("--model-name", default="sentence-transformers/all-minilm-l6-v2", help="The name of the embedding model.")
 @click.option("--dataset-name", default="ArguAna", help="The name of the dataset to use.")
 @click.option("--batch-size", default=16, show_default=True, help="Batch size for embedding.")
 @click.option("--num-queries", default=1, show_default=True, help="Number of queries to process.")
@@ -325,7 +291,8 @@ class CustomQwenEmbeddingModel:
 @click.option("--n-sink-tokens", default=16, show_default=True, help="Number of sink tokens to use.")
 def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_baseline, n_sink_tokens):
     print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}")
-    custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name, is_baseline, n_sink_tokens)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name, is_baseline, n_sink_tokens, tokenizer)
     save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
     if not do_benchmark:
         custom_pooler.embed_documents(save_path, batch_size=batch_size)
