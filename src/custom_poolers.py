@@ -113,6 +113,7 @@ class SinkTokenPooling(models.Pooling):
             last_token_index = torch.argmax(torch.cumsum(attention_mask, dim=1), dim=1)
             attention_mask[:, self.n_sink_tokens:] = 0
             attention_mask = attention_mask.scatter(1, last_token_index.unsqueeze(1), 1)
+            attention_mask += punct_mask
             input_mask_expanded = (
                 attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
             )
