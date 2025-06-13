@@ -87,7 +87,9 @@ class SinkTokenPooling(models.Pooling):
                 else:
                     punct_mask[-1].append(0)
         
-        punct_mask = torch.Tensor(punct_mask)
+        punct_mask = torch.LongTensor(punct_mask)
+        if torch.cuda.is_available():
+            punct_mask = punct_mask.to("cuda")
                 
         attention_mask = (
             features["attention_mask"]
