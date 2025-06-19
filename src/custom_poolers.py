@@ -113,7 +113,7 @@ class SinkTokenPooling(models.Pooling):
         if self.pooling_mode_mean_tokens or self.pooling_mode_mean_sqrt_len_tokens:
             # find the last index where the attention mask is 1
             last_token_index = torch.argmax(torch.cumsum(attention_mask, dim=1), dim=1)
-            attention_mask[:, self.n_sink_tokens:] = 0
+            attention_mask[:, :] = 0
             attention_mask = attention_mask.scatter(1, last_token_index.unsqueeze(1), 1)
             attention_mask += punct_mask
             input_mask_expanded = (
