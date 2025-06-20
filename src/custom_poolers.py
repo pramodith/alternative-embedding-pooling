@@ -437,16 +437,16 @@ def main(
     is_baseline, 
     n_sink_tokens, 
     use_attention_scores, 
-    attention_score_threshold
+    topk_percentile
 ):
-    print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}, {n_sink_tokens}, {use_attention_scores}, {attention_score_threshold}")
+    print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}, {n_sink_tokens}, {use_attention_scores}, {topk_percentile}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     custom_pooler = CustomQwenEmbeddingModel(
         model_name, 
         dataset_name, 
         is_baseline, 
         n_sink_tokens, 
-        tokenizer, use_attention_scores, attention_score_threshold
+        tokenizer, use_attention_scores, topk_percentile
     )
     save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
     if not do_benchmark:
