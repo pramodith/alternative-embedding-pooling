@@ -107,7 +107,7 @@ class SinkTokenPooling(models.Pooling):
         pooling_mode_lasttoken: bool = False,
         include_prompt: bool = True,
         use_attention_scores: bool = False,
-        attention_score_threshold: Optional[float] = None,
+        topk_percentile: Optional[float] = 0.6,
 
     ):
         """Construct.
@@ -158,7 +158,7 @@ class SinkTokenPooling(models.Pooling):
         self.tokenizer = tokenizer
         self.n_sink_tokens = n_sink_tokens
         self.use_attention_scores = use_attention_scores
-        self.attention_score_threshold = attention_score_threshold if attention_score_threshold is not None else 0.3
+        self.topk_percentile = topk_percentile
 
     def forward(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         token_embeddings = features["token_embeddings"]
@@ -167,7 +167,7 @@ class SinkTokenPooling(models.Pooling):
                 if "attention_mask" in features
                 else torch.ones(token_embeddings.shape[:-1], device=token_embeddings.device, dtype=torch.int64)
             )
-        attention_mask[:, :] = 0
+        seq_lengths = attention_mask.sum(1)
 
         punct_mask = []
         special_tokens = self.tokenizer.all_special_tokens
@@ -176,9 +176,27 @@ class SinkTokenPooling(models.Pooling):
         if self.tokenizer.mask_token:
             special_tokens.remove(self.tokenizer.mask_token)
         if self.use_attention_scores:
-            indices_of_interest = features["attention_scores"].mean(1)
-            indices_of_interest = torch.topk(indices_of_interest, k=self.n_sink_tokens, dim=1).indices
-            attention_mask = attention_mask.scatter(1, indices_of_interest, 1)
+            # 1. Mean attention score per token across heads/layers → shape (batch, seq_len)
+            attn_scores = features["attention_scores"].mean(1)
+
+            # 2. Never pick padding tokens: give them −∞ so they are ranked last
+            attn_scores = attn_scores.masked_fill(attention_mask == 0, float("-inf"))
+
+            # 3. New mask where only the selected tokens will be set to 1
+            new_mask = torch.zeros_like(attention_mask)
+
+            # 4. How many tokens to keep in each sequence (ceil(seq_len * pct), ≥ 1)
+            k_per_seq = torch.clamp((seq_lengths.float() * self.topk_percentile).ceil().long(), min=1)
+
+            # 5. For every sequence pick its own top-k tokens
+            for i in range(attn_scores.size(0)):
+                k_i = int(k_per_seq[i].item())
+                # It is safe because attn_scores for padding is -inf
+                topk_idx = torch.topk(attn_scores[i], k=k_i, dim=0).indices
+                new_mask[i, topk_idx] = 1
+
+            attention_mask = new_mask
+
         
         else:
             for input_seq in features["input_ids"]:
@@ -249,7 +267,7 @@ class CustomQwenEmbeddingModel:
         n_sink_tokens: int = 16,
         tokenizer: Optional[AutoTokenizer] = None,
         use_attention_scores: bool = False,
-        attention_score_threshold: Optional[float] = None
+        topk_percentile: Optional[float] = None
     ):
         """Initialize the class.
 
@@ -260,7 +278,7 @@ class CustomQwenEmbeddingModel:
             n_sink_tokens (int): Number of sink tokens to use
             tokenizer (AutoTokenizer): The tokenizer corresponding to the embedding model.
             use_attention_scores (bool): Whether to use attention scores for pooling.
-            attention_score_threshold (Optional[float]): Threshold for attention scores if 
+            topk_percentile (Optional[float]): Percentile of tokens to keep if 
                 use_attention_scores is True
 
         """
@@ -274,7 +292,7 @@ class CustomQwenEmbeddingModel:
                 pooling_mode=None, 
                 pooling_mode_lasttoken=True,
                 use_attention_scores=use_attention_scores,
-                attention_score_threshold=attention_score_threshold
+                topk_percentile=topk_percentile
             )
             self.normalize = models.Normalize()
             self.embedding_model: SentenceTransformer = SentenceTransformerWithAttention(
@@ -405,10 +423,10 @@ class CustomQwenEmbeddingModel:
     help="Whether to use attention scores for pooling."
 )
 @click.option(
-    "--attention-score-threshold", 
-    default=0.3, 
+    "--topk-percentile", 
+    default=0.1, 
     show_default=True, 
-    help="Threshold for attention scores if use_attention_scores is True."
+    help="Percentile of tokens to keep if use_attention_scores is True."
 )
 def main(
     model_name, 
