@@ -4,11 +4,91 @@ import numpy as np
 import string
 import torch
 from sentence_transformers import SentenceTransformer, models
+from sentence_transformers.models import Transformer
+from torch import Tensor
 from transformers import AutoTokenizer
 from typing import Optional
 
 from mteb_utils import get_mteb_retrieval_dataset
 from mteb import MTEB
+from transformers.utils.import_utils import is_peft_available
+
+class TransfromerWithAttention(models.Transformer):
+    """
+    Subclass of Transformer that returns attention weights.
+    """
+    def forward(self, features: dict[str, torch.Tensor], **kwargs) -> dict[str, torch.Tensor]:
+        """Returns token_embeddings, cls_token"""
+        trans_features = {
+            key: value
+            for key, value in features.items()
+            if key in ["input_ids", "attention_mask", "token_type_ids", "inputs_embeds"]
+        }
+
+        outputs = self.auto_model(**trans_features, **kwargs, return_dict=True)
+        token_embeddings = outputs[0]
+        features["token_embeddings"] = token_embeddings
+        features["attention_scores"] = [attention for attention in outputs.attentions]
+        features["attention_scores"] = torch.stack(features["attention_scores"], dim=0)\
+                .permute(1, 0, 2, 3, 4)
+        features["attention_scores"] = torch.max(
+            torch.mean(features["attention_scores"], dim=-2),
+            dim=2
+        ).values
+
+        # If the AutoModel is wrapped with a PeftModelForFeatureExtraction, then it may have added virtual tokens
+        # We need to extend the attention mask to include these virtual tokens, or the pooling will fail
+        if is_peft_available():
+            from peft import PeftModelForFeatureExtraction
+
+            if (
+                isinstance(self.auto_model, PeftModelForFeatureExtraction)
+                and self.auto_model.active_peft_config.is_prompt_learning
+            ):
+                batch_size = token_embeddings.size(0)
+                attention_mask = features["attention_mask"]
+                prefix_attention_mask = torch.ones(
+                    batch_size, self.auto_model.active_peft_config.num_virtual_tokens, device=attention_mask.device
+                )
+                features["attention_mask"] = torch.cat((prefix_attention_mask, attention_mask), dim=1)
+
+        if self.auto_model.config.output_hidden_states and "hidden_states" in outputs:
+            features["all_layer_embeddings"] = outputs["hidden_states"]
+
+        return features
+    
+class SentenceTransformerWithAttention(SentenceTransformer):
+    """
+    Subclass of SentenceTransformer that propagates attention_weights from the transformer
+    module to the features dict passed to the pooling module (e.g., SinkTokenPooling).
+    """
+    def forward(self, input: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        # Get the transformer module
+        transformer: Transformer = None
+        pooling = None
+        for _, module in self._modules.items():
+            if isinstance(module, Transformer):
+                transformer = module
+            elif isinstance(module, models.Pooling):
+                pooling = module
+        if transformer is None or pooling is None:
+            raise ValueError("Model must have both a Transformer and a Pooling module.")
+    
+        features = {}
+        features.update(input)
+        # Forward through transformer (returns output dict)
+        output = transformer.forward(features=input, output_attentions=True)
+        features.update(output)
+
+        # If attention_weights are present, propagate them
+        if 'attention_weights' in output:
+            features['attention_weights'] = output['attention_weights']
+        elif hasattr(output.get('model_output', {}), 'attentions'):
+            features['attention_weights'] = output['model_output'].attentions
+
+        # Forward through pooling (SinkTokenPooling)
+        features = pooling.forward(features)
+        return features
 
 class SinkTokenPooling(models.Pooling):
     """Pool the sink tokens."""
@@ -26,6 +106,9 @@ class SinkTokenPooling(models.Pooling):
         pooling_mode_weightedmean_tokens: bool = False,
         pooling_mode_lasttoken: bool = False,
         include_prompt: bool = True,
+        use_attention_scores: bool = False,
+        attention_score_threshold: Optional[float] = None,
+
     ):
         """Construct.
 
@@ -54,7 +137,12 @@ class SinkTokenPooling(models.Pooling):
                 included in the pooling. This is useful for reproducing
                 work that does not include the prompt tokens in the pooling
                 like INSTRUCTOR, but otherwise not recommended.
-
+            use_attention_scores: If set to True, the attention scores are
+                used to determine which tokens to pool over. If set to False,
+                the pooling is done over all tokens except for special tokens
+                and punctuation.
+            attention_score_threshold: If use_attention_scores is True, this
+                threshold is used to determine which tokens to pool over.
         """
         super().__init__(
             word_embedding_dimension=word_embedding_dimension,  # Replace `None` with the actual dimension if known
@@ -69,33 +157,48 @@ class SinkTokenPooling(models.Pooling):
         )
         self.tokenizer = tokenizer
         self.n_sink_tokens = n_sink_tokens
+        self.use_attention_scores = use_attention_scores
+        self.attention_score_threshold = attention_score_threshold if attention_score_threshold is not None else 0.3
 
     def forward(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         token_embeddings = features["token_embeddings"]
+        attention_mask = (
+                features["attention_mask"]
+                if "attention_mask" in features
+                else torch.ones(token_embeddings.shape[:-1], device=token_embeddings.device, dtype=torch.int64)
+            )
+        attention_mask[:, :] = 0
+
         punct_mask = []
         special_tokens = self.tokenizer.all_special_tokens
         if self.tokenizer.pad_token:
             special_tokens.remove(self.tokenizer.pad_token)
         if self.tokenizer.mask_token:
             special_tokens.remove(self.tokenizer.mask_token)
-        for input_seq in features["input_ids"]:
-            punct_mask.append([])
-            tokens = self.tokenizer.convert_ids_to_tokens(input_seq.tolist())
-            for token in tokens:
-                if token in string.punctuation or token in self.tokenizer.all_special_tokens:
-                    punct_mask[-1].append(1)
-                else:
-                    punct_mask[-1].append(0)
+        if self.use_attention_scores:
+            indices_of_interest = features["attention_scores"].mean(1)
+            indices_of_interest = torch.topk(indices_of_interest, k=self.n_sink_tokens, dim=1).indices
+            attention_mask = attention_mask.scatter(1, indices_of_interest, 1)
         
-        punct_mask = torch.LongTensor(punct_mask)
-        if torch.cuda.is_available():
-            punct_mask = punct_mask.to("cuda")
-                
-        attention_mask = (
-            features["attention_mask"]
-            if "attention_mask" in features
-            else torch.ones(token_embeddings.shape[:-1], device=token_embeddings.device, dtype=torch.int64)
-        )
+        else:
+            for input_seq in features["input_ids"]:
+                punct_mask.append([])
+                tokens = self.tokenizer.convert_ids_to_tokens(input_seq.tolist())
+                for token in tokens:
+                    if token in string.punctuation or token in self.tokenizer.all_special_tokens:
+                        punct_mask[-1].append(1)
+                    else:
+                        punct_mask[-1].append(0)
+            
+            punct_mask = torch.LongTensor(punct_mask)
+            if torch.cuda.is_available():
+                punct_mask = punct_mask.to("cuda")
+                    
+            last_token_index = torch.argmax(torch.cumsum(attention_mask, dim=1), dim=1)
+            attention_mask[:, :] = 0
+            attention_mask = attention_mask.scatter(1, last_token_index.unsqueeze(1), 1)
+            attention_mask += punct_mask
+            
         if not self.include_prompt and "prompt_length" in features:
             prompt_length = features["prompt_length"]
             # prompt_length is either:
@@ -112,10 +215,6 @@ class SinkTokenPooling(models.Pooling):
         output_vectors = []
         if self.pooling_mode_mean_tokens or self.pooling_mode_mean_sqrt_len_tokens:
             # find the last index where the attention mask is 1
-            last_token_index = torch.argmax(torch.cumsum(attention_mask, dim=1), dim=1)
-            attention_mask[:, :] = 0
-            attention_mask = attention_mask.scatter(1, last_token_index.unsqueeze(1), 1)
-            attention_mask += punct_mask
             input_mask_expanded = (
                 attention_mask.unsqueeze(-1).expand(token_embeddings.size()).to(token_embeddings.dtype)
             )
@@ -148,7 +247,9 @@ class CustomQwenEmbeddingModel:
         dataset_name: str, 
         is_baseline: bool = False, 
         n_sink_tokens: int = 16,
-        tokenizer: Optional[AutoTokenizer] = None
+        tokenizer: Optional[AutoTokenizer] = None,
+        use_attention_scores: bool = False,
+        attention_score_threshold: Optional[float] = None
     ):
         """Initialize the class.
 
@@ -158,20 +259,25 @@ class CustomQwenEmbeddingModel:
             is_baseline (bool): Whether the default pooling mechanism should be used or not
             n_sink_tokens (int): Number of sink tokens to use
             tokenizer (AutoTokenizer): The tokenizer corresponding to the embedding model.
+            use_attention_scores (bool): Whether to use attention scores for pooling.
+            attention_score_threshold (Optional[float]): Threshold for attention scores if 
+                use_attention_scores is True
 
         """
         
         if not is_baseline:
-            self.transformer = models.Transformer(model_name)
+            self.transformer = TransfromerWithAttention(model_name)
             self.sink_token_pooler = SinkTokenPooling(
                 n_sink_tokens, 
                 tokenizer,
                 1024, 
                 pooling_mode=None, 
-                pooling_mode_lasttoken=True
+                pooling_mode_lasttoken=True,
+                use_attention_scores=use_attention_scores,
+                attention_score_threshold=attention_score_threshold
             )
             self.normalize = models.Normalize()
-            self.embedding_model: SentenceTransformer = SentenceTransformer(
+            self.embedding_model: SentenceTransformer = SentenceTransformerWithAttention(
                 modules=[self.transformer, self.sink_token_pooler, self.normalize]
             )
             self.embedding_model.model_card_data.model_name = f"{model_name}-sink-pooler"
@@ -292,10 +398,38 @@ class CustomQwenEmbeddingModel:
     help="Whether to use the default pooler or not."
 )
 @click.option("--n-sink-tokens", default=16, show_default=True, help="Number of sink tokens to use.")
-def main(model_name, dataset_name, batch_size, num_queries, do_benchmark, is_baseline, n_sink_tokens):
-    print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}")
+@click.option(
+    "--use-attention-scores", 
+    is_flag=True, 
+    default=True, 
+    help="Whether to use attention scores for pooling."
+)
+@click.option(
+    "--attention-score-threshold", 
+    default=0.3, 
+    show_default=True, 
+    help="Threshold for attention scores if use_attention_scores is True."
+)
+def main(
+    model_name, 
+    dataset_name, 
+    batch_size, 
+    num_queries, 
+    do_benchmark, 
+    is_baseline, 
+    n_sink_tokens, 
+    use_attention_scores, 
+    attention_score_threshold
+):
+    print(f"Args are :{model_name}, {dataset_name}, {batch_size}, {num_queries}, {do_benchmark}, {is_baseline}, {n_sink_tokens}, {use_attention_scores}, {attention_score_threshold}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    custom_pooler = CustomQwenEmbeddingModel(model_name, dataset_name, is_baseline, n_sink_tokens, tokenizer)
+    custom_pooler = CustomQwenEmbeddingModel(
+        model_name, 
+        dataset_name, 
+        is_baseline, 
+        n_sink_tokens, 
+        tokenizer, use_attention_scores, attention_score_threshold
+    )
     save_path = f"./data/{model_name.split('/')[1]}_{dataset_name}.npy"
     if not do_benchmark:
         custom_pooler.embed_documents(save_path, batch_size=batch_size)
